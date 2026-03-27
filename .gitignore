@@ -1,0 +1,63 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node / frontend
+node_modules/
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.env/
+.venv/
+venv/
+
+# Java / JVM
+*.class
+*.jar
+*.war
+*.ear
+*.iml
+target/
+out/
+
+# Logs and temp
+*.log
+logs/
+tmp/
+temp/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+*archive.zip
+
+# Environment & secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Coverage / reports
+.coverage
+coverage/
+htmlcov/
+reports/
+
+# Misc build artifacts
+*.out
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Ignore archive and data
+archive.zip
+data/
