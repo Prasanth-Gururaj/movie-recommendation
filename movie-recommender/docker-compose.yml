@@ -1,0 +1,151 @@
+# ============================================================
+# docker-compose.yml — full local development stack
+# Run: docker-compose up --build
+#
+# Services:
+#   api        FastAPI recommendation service (port 8000)
+#   postgres   Feature store (port 5432)
+#   redis      Feature cache (port 6379)
+#   mlflow     Experiment tracking UI (port 5001)
+#   prometheus Metrics scraping (port 9090)
+#   grafana    Dashboards (port 3000)
+#
+# STARTUP ORDER:
+#   1. python train.py --config configs/experiments/xgb_full_tuned.yaml
+#   2. python scripts/populate_feature_store.py
+#   3. docker-compose up --build
+#   4. python scripts/warm_cache.py  (optional)
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL — feature store ──────────────────────────────
+  postgres:
+    image: postgres:15-alpine           # alpine = smaller image
+    container_name: recommender_postgres
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-recommender}
+      POSTGRES_USER:     ${POSTGRES_USER:-recommender}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-recommender}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Redis — feature cache ───────────────────────────────────
+  redis:
+    image: redis:7-alpine               # alpine = smaller image
+    container_name: recommender_redis
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save ""                         # disable persistence for cache
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── MLflow — experiment tracking + model registry ───────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.3
+    container_name: recommender_mlflow
+    environment:
+      MLFLOW_BACKEND_STORE_URI: sqlite:///mlruns/mlflow.db
+      MLFLOW_ARTIFACT_ROOT:     /mlruns/artifacts
+    volumes:
+      - ./mlruns:/mlruns                # local mlruns folder mounted
+    ports:
+      - "5001:5000"                     # 5001 locally to avoid conflicts
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlruns/mlflow.db
+      --default-artifact-root /mlruns/artifacts
+    restart: unless-stopped
+
+  # ── FastAPI — recommendation service ────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+    container_name: recommender_api
+    env_file:
+      - .env                            # load all env vars from .env
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      POSTGRES_HOST:       postgres
+      REDIS_HOST:          redis
+    volumes:
+      # Mount processed data and model artifacts — not baked into image
+      - ./data/processed:/app/data/processed:ro
+      - ./mlruns:/app/mlruns:ro
+      - ./configs:/app/configs:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s                 # model loading takes time
+      retries: 3
+    restart: unless-stopped
+
+  # ── Prometheus — metrics collection ─────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: recommender_prometheus
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # ── Grafana — dashboards ─────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: recommender_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER:     admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana_dashboard.json:/etc/grafana/provisioning/dashboards/recommender.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  grafana_data:

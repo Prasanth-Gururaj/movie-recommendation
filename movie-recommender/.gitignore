@@ -14,7 +14,7 @@ __pycache__/
 *.pyd
 .env/
 .venv/
-venv/
+movie/
 
 # Java / JVM
 *.class
@@ -44,6 +44,7 @@ temp/
 .env.*
 *.key
 *.pem
+movie_recommender.egg-info
 
 # Coverage / reports
 .coverage

@@ -1,58 +1,51 @@
 # ============================================================
 # requirements.txt — PINNED production dependencies
-# Generated from pyproject.toml
-# DO NOT EDIT MANUALLY — re-run pip-compile to update:
-#   pip-compile pyproject.toml -o requirements.txt
+# Python 3.12 | Windows (local dev) + Linux x86_64 (Docker)
 #
-# Verified compatible stack — March 2026
-# Python: 3.11
+# NOTE: uvloop and httptools excluded — Windows incompatible.
+# They are only needed inside Docker (Linux). The Dockerfile
+# installs them separately via uvicorn[standard].
 # ============================================================
 
-# ── core data ───────────────────────────────────────────────
+# ── core data ────────────────────────────────────────────────
 pandas==2.2.2
-numpy==1.26.4            # pinned to 1.26.x — broadest compat with all libs
+numpy==1.26.4
 pyarrow==15.0.2
 scipy==1.13.1
 
-# ── ML ──────────────────────────────────────────────────────
+# ── ML ───────────────────────────────────────────────────────
 scikit-learn==1.5.2
-xgboost==2.1.4           # pinned to 2.1.x — stable, avoids 3.x breaking changes
-lightgbm==4.5.0          # 4.4+ for numpy 2.x compat; 4.5 is stable
-implicit==0.7.2          # latest stable
-faiss-cpu==1.8.0         # conservative pin — 1.13.x exists but new API changes
+xgboost==2.1.4
+lightgbm==4.5.0
+implicit==0.7.2
+faiss-cpu==1.8.0.post1
 
-# ── MLflow ──────────────────────────────────────────────────
-mlflow==2.14.3           # 2.x — avoids MLflow 3.x breaking changes
-# mlflow transitive deps (critical ones pinned)
+# ── MLflow ───────────────────────────────────────────────────
+mlflow==2.14.3
 alembic==1.13.2
 sqlalchemy==2.0.31
-flask==3.0.3             # mlflow UI backend
-gunicorn==22.0.0
 
-# ── API ─────────────────────────────────────────────────────
+# ── API ──────────────────────────────────────────────────────
 fastapi==0.111.1
 uvicorn==0.30.3
-uvloop==0.19.0           # uvicorn[standard] dep — faster event loop
-httptools==0.6.1         # uvicorn[standard] dep
-starlette==0.37.2        # fastapi dep
 pydantic==2.8.2
-pydantic-core==2.20.1    # pydantic dep
-anyio==4.4.0             # starlette/fastapi dep
+pydantic-core==2.20.1
+starlette==0.37.2
+anyio==4.4.0
+python-multipart==0.0.9
 
-# ── database / cache ────────────────────────────────────────
+# ── database / cache ─────────────────────────────────────────
 asyncpg==0.29.0
 redis==5.0.8
 
-# ── monitoring ──────────────────────────────────────────────
+# ── monitoring ───────────────────────────────────────────────
 prometheus-client==0.20.0
 
-# ── utilities ───────────────────────────────────────────────
+# ── utilities ────────────────────────────────────────────────
 click==8.1.7
 pyyaml==6.0.2
 python-dotenv==1.0.1
 tqdm==4.66.5
-
-# ── transitive deps (common conflict sources — pinned) ──────
 packaging==24.1
 certifi==2024.7.4
 urllib3==2.2.2

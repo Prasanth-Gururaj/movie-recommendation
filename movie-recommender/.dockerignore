@@ -1,0 +1,53 @@
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# ── Virtual environment ───────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Data — NEVER in Docker image ─────────────────────────────
+data/raw/
+data/processed/
+
+# ── MLflow runs — mounted as volume not baked in ─────────────
+mlruns/
+
+# ── Notebooks — not needed in production image ───────────────
+notebooks/
+
+# ── Test files — not needed in production image ──────────────
+tests/
+
+# ── Reports — generated, not source code ─────────────────────
+reports/
+
+# ── Git ───────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Dev tools ────────────────────────────────────────────────
+.github/
+requirements-dev.txt
+pyproject.toml
+
+# ── OS files ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Secrets — NEVER in image ─────────────────────────────────
+.env
+*.key
+*.pem
+
+# ── Archive ───────────────────────────────────────────────────
+*.zip
+*.tar.gz
