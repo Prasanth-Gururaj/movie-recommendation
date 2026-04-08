@@ -58,15 +58,19 @@ class ALSCandidateGenerator(BaseCandidateGenerator):
 
     # ── fit ───────────────────────────────────────────────────────────────
 
-    def fit(self, train_df: pd.DataFrame) -> None:
+    def fit(self, train_df: pd.DataFrame, save_dir: Path | None = None) -> None:
         """Train ALS, build FAISS index, persist artefacts.
 
         Parameters
         ----------
         train_df:
             Training split — requires ``userId``, ``movieId``, ``rating``.
+        save_dir:
+            Directory to write artefacts.  Defaults to ``data/processed/``.
+            Pass ``data/sample/`` when running in --sample mode.
         """
-        _PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(save_dir) if save_dir is not None else _PROCESSED_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         # Build compact user/item indices
         unique_users = sorted(train_df["userId"].unique().tolist())
@@ -78,18 +82,15 @@ class ALSCandidateGenerator(BaseCandidateGenerator):
         n_users = len(unique_users)
         n_items = len(unique_movies)
 
-        # Build user-item sparse matrix (confidence = 1 + alpha * rating)
-        # implicit uses (items × users) orientation
-        rows, cols, data = [], [], []
-        for _, row in train_df.iterrows():
-            uid = self._user_id_to_idx[int(row["userId"])]
-            mid = self._movie_id_to_idx[int(row["movieId"])]
-            rows.append(mid)   # item axis
-            cols.append(uid)   # user axis
-            data.append(float(row["rating"]))
+        # Build user-item sparse matrix — implicit ≥0.6 expects (users × items)
+        uid_idx = train_df["userId"].map(self._user_id_to_idx).values
+        mid_idx = train_df["movieId"].map(self._movie_id_to_idx).values
+        ratings = train_df["rating"].values.astype(np.float32)
 
-        item_user_matrix = sp.csr_matrix(
-            (data, (rows, cols)), shape=(n_items, n_users), dtype=np.float32
+        user_item_matrix = sp.csr_matrix(
+            (ratings, (uid_idx, mid_idx)),
+            shape=(n_users, n_items),
+            dtype=np.float32,
         )
 
         # Train ALS
@@ -104,7 +105,7 @@ class ALSCandidateGenerator(BaseCandidateGenerator):
             self._config.als_factors,
             self._config.als_iterations,
         )
-        model.fit(item_user_matrix)
+        model.fit(user_item_matrix)
 
         self._user_factors = model.user_factors   # shape: (n_users, factors)
         self._item_factors = model.item_factors   # shape: (n_items, factors)
@@ -121,10 +122,14 @@ class ALSCandidateGenerator(BaseCandidateGenerator):
         self._faiss_index = index
 
         # ── Persist artefacts ─────────────────────────────────────────────
-        faiss.write_index(index, str(_PROCESSED_DIR / "faiss_item_index.bin"))
-        np.save(_PROCESSED_DIR / "als_user_factors.npy", self._user_factors)
-        np.save(_PROCESSED_DIR / "als_item_factors.npy", self._item_factors)
-        np.save(_PROCESSED_DIR / "als_movie_id_map.npy", self._movie_id_map)
+        faiss.write_index(index, str(out_dir / "faiss_item_index.bin"))
+        np.save(out_dir / "als_user_factors.npy", self._user_factors)
+        np.save(out_dir / "als_item_factors.npy", self._item_factors)
+        np.save(out_dir / "als_movie_id_map.npy", self._movie_id_map)
+        # Save user ID map so train.py can reconstruct user_id_to_idx exactly
+        # (must match the order used during fit — do NOT reconstruct from user_features.parquet)
+        user_id_map = np.array(unique_users, dtype=np.int32)
+        np.save(out_dir / "als_user_id_map.npy", user_id_map)
 
         self._is_fitted = True
         logger.info(

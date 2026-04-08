@@ -14,6 +14,11 @@ class TrainingConfig(BaseConfig):
     # ── MLflow experiment bookkeeping ─────────────────────────────────────────
     experiment_name: str = "movie_recommender"
     run_name: str = "baseline"
+    mlflow_tracking_uri: str = "mlruns"
+
+    # ── recommender type ──────────────────────────────────────────────────────
+    # options: "popularity", "genre_pop", "cf", "als", "two_stage"
+    recommender_type: str = "two_stage"
 
     # ── candidate generation ──────────────────────────────────────────────────
     candidate_pool_size: int = 300

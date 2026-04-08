@@ -1,0 +1,64 @@
+data:
+  train_end_year: 2016
+  val_year: 2017
+  test_start_year: 2018
+  relevance_threshold: 4.0
+  cold_user_threshold: 20
+  cold_item_threshold: 10
+  negative_sample_ratio: 4
+  random_seed: 42
+  raw_data_dir: data/raw
+  processed_data_dir: data/processed
+
+feature:
+  genre_vector_dim: 18
+  n_genome_tags: 50
+  recent_activity_days: 90
+
+model:
+  model_type: xgboost
+  n_estimators: 500
+  learning_rate: 0.05
+  max_depth: 6
+  min_child_weight: 1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  early_stopping: 50
+  random_seed: 42
+  objective: rank:pairwise
+  device: cuda
+
+training:
+  recommender_type: two_stage
+  experiment_name: movie_recommender_xgb
+  run_name: xgb_user_item_only
+  candidate_pool_size: 300
+  als_factors: 64
+  als_iterations: 20
+  als_regularization: 0.01
+  faiss_index_type: IndexFlatIP
+  n_candidates_pop: 100
+  n_candidates_cf: 100
+  n_candidates_mf: 100
+
+eval:
+  k: 10
+  warm_user_min_positives: 3
+  metrics:
+    - map
+    - ndcg
+    - precision
+    - recall
+    - mrr
+  diversity_metrics:
+    - catalog_coverage
+    - intra_list_diversity
+    - novelty
+    - cold_item_exposure
+  catalog_coverage_target: 0.15
+  intra_list_diversity_target: 0.6
+  cold_item_exposure_target: 0.05
+  n_candidates_pop_eval: 500
+  n_candidates_cf_eval: 300
+  n_candidates_mf_eval: 500
+  n_history_candidates: 50

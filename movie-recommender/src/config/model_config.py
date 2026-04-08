@@ -19,6 +19,7 @@ class XGBConfig(BaseConfig):
     early_stopping: int = 50
     random_seed: int = 42
     objective: str = "rank:pairwise"
+    device: str = "cpu"
 
     def validate(self) -> None:
         assert 0.001 <= self.learning_rate <= 1.0, (
@@ -50,6 +51,7 @@ class LGBMConfig(BaseConfig):
     early_stopping: int = 50
     lambdarank_truncation_level: int = 10
     random_seed: int = 42
+    device: str = "cpu"
 
     def validate(self) -> None:
         assert 0.001 <= self.learning_rate <= 1.0, (

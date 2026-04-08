@@ -160,13 +160,20 @@ class UserFeatureBuilder(BaseFeatureBuilder):
         if not avail:
             return pd.DataFrame(columns=out_cols)
 
-        merged = positives_df[["userId", "movieId"]].merge(
-            movies_df[["movieId"] + avail], on="movieId", how="left"
-        )
-        merged[avail] = merged[avail].fillna(0)
+        # Chunked merge to avoid OOM (dense merge of 10M rows × 18 genres ~ 1.4 GiB)
+        movie_genre_lookup = movies_df.set_index("movieId")[avail]
+        chunk_size = 500_000
+        pairs = positives_df[["userId", "movieId"]].reset_index(drop=True)
+        chunks = []
+        for start in range(0, len(pairs), chunk_size):
+            chunk = pairs.iloc[start : start + chunk_size]
+            genre_vals = movie_genre_lookup.reindex(chunk["movieId"].values, fill_value=0)
+            genre_vals.index = chunk.index
+            chunks.append(pd.concat([chunk[["userId"]], genre_vals], axis=1))
+        all_pos = pd.concat(chunks, ignore_index=True)
 
-        genre_sums = merged.groupby("userId")[avail].sum()
-        pos_counts = merged.groupby("userId").size().rename("_n")
+        genre_sums = all_pos.groupby("userId")[avail].sum()
+        pos_counts = all_pos.groupby("userId").size().rename("_n")
         affinity = genre_sums.div(pos_counts, axis=0).reset_index()
         affinity = affinity.rename(columns={g: f"{prefix}{g}" for g in avail})
 

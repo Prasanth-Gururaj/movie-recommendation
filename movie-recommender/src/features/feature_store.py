@@ -1,8 +1,10 @@
 """FeatureStore — orchestrates all feature builders and assembles the training matrix.
 
-build_all_features()      → builds, assembles, saves parquet + feature_columns.json
+build_all_features()          → builds train/val/test parquets + user/item parquets
+                                + injects mf_scores if als_gen provided
+                                + saves feature_columns.json LAST
 assemble_inference_features() → reconstructs feature row(s) from dicts at serving time
-get_negative_samples()    → negative sampling for training
+get_negative_samples()        → negative sampling for training
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from src.features.interaction_features import InteractionFeatureBuilder
 from src.features.item_features import ItemFeatureBuilder
 from src.features.time_features import TimeFeatureBuilder
 from src.features.user_features import UserFeatureBuilder
+from src.ingestion.splitter import get_warm_items
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +35,7 @@ class FeatureStore:
     Parameters
     ----------
     config:
-        Master experiment config.  Sub-config fields used:
-          - data.relevance_threshold, data.cold_user_threshold, …
-          - feature.n_genome_tags, feature.activity_short_window, …
-          - data.processed_data_dir  (where parquet files are saved)
+        Master experiment config.
     """
 
     def __init__(self, config: ExperimentConfig) -> None:
@@ -60,27 +60,42 @@ class FeatureStore:
         train_df: pd.DataFrame,
         val_df: pd.DataFrame,
         test_df: pd.DataFrame,
+        als_gen=None,
     ) -> None:
-        """Build all feature tables from training data, assemble matrix, save.
+        """Build all feature tables and save to processed_data_dir.
 
         Steps
         -----
-        1. User features (train only)
-        2. Item features (train + movies)
-        3. Interaction features (train pairs)
-        4. Time features (train pairs)
-        5. Assemble training matrix
-        6. Save feature_columns.json  ← locked column order for inference
-        7. Save parquet files to processed_data_dir
+        1.  User features (from train)
+        2.  Item features (from train)
+        3.  Interaction features (train pairs)
+        4.  Time features (train pairs)
+        5.  Determine feature_columns order
+        6.  Write train_features.parquet (chunked, ~20 M rows)
+        7.  Write val_features.parquet   (same schema)
+        8.  Write test_features.parquet  (same schema)
+        9.  Save user_features.parquet + item_features.parquet
+        10. Save feature_columns.json (LAST — only after all three verified)
+
+        Parameters
+        ----------
+        als_gen:
+            Optional fitted ALSCandidateGenerator.  When provided the
+            ``mf_score`` column is populated with real ALS dot-product
+            scores instead of the 0.0 placeholder.
         """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
         out_dir = Path(self._config.data.processed_data_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Ensure is_positive exists
         threshold = self._config.data.relevance_threshold
-        if "is_positive" not in train_df.columns:
-            train_df = train_df.copy()
-            train_df["is_positive"] = (train_df["rating"] >= threshold).astype("int8")
+
+        # Ensure is_positive exists on all splits
+        for split_name, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+            if "is_positive" not in df.columns:
+                df["is_positive"] = (df["rating"] >= threshold).astype("int8")
 
         # ── 1. user features ──────────────────────────────────────────────
         logger.info("Building user features …")
@@ -94,64 +109,121 @@ class FeatureStore:
         item_features_df = item_builder.build(data, train_df)
         data = {**data, "item_features": item_features_df}
 
-        # ── 3. interaction features ───────────────────────────────────────
-        logger.info("Building interaction features …")
+        # Use actual train ratings only — no synthetic negatives
+        # Ratings >= threshold = positive, ratings < threshold = negative
+        train_extended = train_df.copy()
+        logger.info(
+            "Using actual train ratings only: %d rows (no synthetic negatives).",
+            len(train_extended),
+        )
+
+        # ── 3. interaction features (train) ───────────────────────────────
+        # train_df (actual ratings only) is used for user-profile computation;
+        # train_extended (actual + synthetic negatives) defines which pairs get rows.
+        logger.info("Building interaction features (train) …")
         interaction_builder = InteractionFeatureBuilder(self._config)
-        interaction_df = interaction_builder.build(data, train_df)
+        interaction_df = interaction_builder.build(data, train_df, pairs_df=train_extended)
 
-        # ── 4. time features ──────────────────────────────────────────────
-        logger.info("Building time features …")
+        # ── 4. time features (train) ──────────────────────────────────────
+        logger.info("Building time features (train) …")
         time_builder = TimeFeatureBuilder(self._config)
-        time_df = time_builder.build(data, train_df)
+        time_df = time_builder.build(data, train_df, pairs_df=train_extended)
 
-        # ── 5. assemble training matrix ───────────────────────────────────
-        logger.info("Assembling training matrix …")
+        # ── 5. feature_columns ────────────────────────────────────────────
         u_feat_names = [c for c in user_builder.get_feature_names() if c in user_features_df.columns]
         i_feat_names = [c for c in item_builder.get_feature_names() if c in item_features_df.columns]
         intr_feat_names = [c for c in interaction_builder.get_feature_names() if c in interaction_df.columns]
         time_feat_names = [c for c in time_builder.get_feature_names() if c in time_df.columns]
 
-        train_matrix = (
-            train_df[["userId", "movieId", "is_positive"]]
-            .drop_duplicates(subset=["userId", "movieId"])
-            .reset_index(drop=True)
-            .copy()
+        self.feature_columns = list(
+            dict.fromkeys(u_feat_names + i_feat_names + intr_feat_names + time_feat_names)
         )
 
-        train_matrix = train_matrix.merge(
-            user_features_df[["userId"] + u_feat_names], on="userId", how="left"
-        )
-        train_matrix = train_matrix.merge(
-            item_features_df[["movieId"] + i_feat_names], on="movieId", how="left"
-        )
-        train_matrix = train_matrix.merge(
-            interaction_df[["userId", "movieId"] + intr_feat_names],
-            on=["userId", "movieId"],
-            how="left",
-        )
-        train_matrix = train_matrix.merge(
-            time_df[["userId", "movieId"] + time_feat_names],
-            on=["userId", "movieId"],
-            how="left",
+        # Build shared index maps and pre-loaded feature matrices (all small)
+        uid_to_idx = {int(u): i for i, u in enumerate(user_features_df["userId"].values)}
+        mid_to_idx = {int(m): i for i, m in enumerate(item_features_df["movieId"].values)}
+        u_mat = user_features_df[u_feat_names].values.astype(np.float32)
+        i_mat = item_features_df[i_feat_names].values.astype(np.float32)
+
+        # ── 6. train_features.parquet (chunked for 20 M rows) ─────────────
+        logger.info("Assembling train_features.parquet …")
+        interaction_df = interaction_df.sort_values("userId").reset_index(drop=True)
+        _write_feature_parquet(
+            split_df=train_extended,
+            interaction_df=interaction_df,
+            time_df=time_df,
+            u_feat_names=u_feat_names,
+            i_feat_names=i_feat_names,
+            intr_feat_names=intr_feat_names,
+            time_feat_names=time_feat_names,
+            feature_columns=self.feature_columns,
+            uid_to_idx=uid_to_idx,
+            mid_to_idx=mid_to_idx,
+            u_mat=u_mat,
+            i_mat=i_mat,
+            als_gen=als_gen,
+            output_path=out_dir / "train_features.parquet",
         )
 
-        # ── 6. feature_columns.json ───────────────────────────────────────
-        self.feature_columns = u_feat_names + i_feat_names + intr_feat_names + time_feat_names
-        with _FEATURE_COLUMNS_PATH.open("w", encoding="utf-8") as f:
-            json.dump(self.feature_columns, f, indent=2)
-        logger.info("Saved feature_columns.json with %d columns.", len(self.feature_columns))
+        # ── 7. val_features.parquet ───────────────────────────────────────
+        logger.info("Building interaction features (val) …")
+        val_interaction_df = interaction_builder.build(data, train_df, pairs_df=val_df)
+        val_time_df = time_builder.build(data, train_df, pairs_df=val_df)
 
-        # ── 7. save parquet ───────────────────────────────────────────────
-        train_matrix.to_parquet(
-            out_dir / "train_features.parquet", engine="pyarrow", index=False
+        logger.info("Assembling val_features.parquet …")
+        _write_feature_parquet(
+            split_df=val_df,
+            interaction_df=val_interaction_df,
+            time_df=val_time_df,
+            u_feat_names=u_feat_names,
+            i_feat_names=i_feat_names,
+            intr_feat_names=intr_feat_names,
+            time_feat_names=time_feat_names,
+            feature_columns=self.feature_columns,
+            uid_to_idx=uid_to_idx,
+            mid_to_idx=mid_to_idx,
+            u_mat=u_mat,
+            i_mat=i_mat,
+            als_gen=als_gen,
+            output_path=out_dir / "val_features.parquet",
         )
+
+        # ── 8. test_features.parquet ──────────────────────────────────────
+        logger.info("Building interaction features (test) …")
+        test_interaction_df = interaction_builder.build(data, train_df, pairs_df=test_df)
+        test_time_df = time_builder.build(data, train_df, pairs_df=test_df)
+
+        logger.info("Assembling test_features.parquet …")
+        _write_feature_parquet(
+            split_df=test_df,
+            interaction_df=test_interaction_df,
+            time_df=test_time_df,
+            u_feat_names=u_feat_names,
+            i_feat_names=i_feat_names,
+            intr_feat_names=intr_feat_names,
+            time_feat_names=time_feat_names,
+            feature_columns=self.feature_columns,
+            uid_to_idx=uid_to_idx,
+            mid_to_idx=mid_to_idx,
+            u_mat=u_mat,
+            i_mat=i_mat,
+            als_gen=als_gen,
+            output_path=out_dir / "test_features.parquet",
+        )
+
+        # ── 9. save user / item parquet ───────────────────────────────────
         user_features_df.to_parquet(
             out_dir / "user_features.parquet", engine="pyarrow", index=False
         )
         item_features_df.to_parquet(
             out_dir / "item_features.parquet", engine="pyarrow", index=False
         )
-        logger.info("Feature parquet files saved to %s.", out_dir)
+        logger.info("User/item feature parquet files saved to %s.", out_dir)
+
+        # ── 10. feature_columns.json — written LAST ───────────────────────
+        with _FEATURE_COLUMNS_PATH.open("w", encoding="utf-8") as f:
+            json.dump(self.feature_columns, f, indent=2)
+        logger.info("Saved feature_columns.json with %d columns.", len(self.feature_columns))
 
     # ── inference assembly ─────────────────────────────────────────────────
 
@@ -161,21 +233,7 @@ class FeatureStore:
         item_features_list: list[dict],
         request_context: dict,
     ) -> pd.DataFrame:
-        """Assemble a feature DataFrame for a batch of candidate items.
-
-        Each row = one candidate item.  The output columns are guaranteed to
-        match ``self.feature_columns`` (loaded from feature_columns.json).
-        Missing features are filled with 0.0 — never NaN.
-
-        Parameters
-        ----------
-        user_features:
-            Flat dict of the requesting user's pre-computed features.
-        item_features_list:
-            One dict per candidate item.
-        request_context:
-            Additional context such as ``{"timestamp": <unix_ts>}``.
-        """
+        """Assemble a feature DataFrame for a batch of candidate items."""
         rows = []
         for item_feat in item_features_list:
             row = {**user_features, **item_feat, **request_context}
@@ -186,8 +244,6 @@ class FeatureStore:
 
         df = pd.DataFrame(rows)
         df = df.reindex(columns=self.feature_columns, fill_value=0.0)
-
-        # Ensure numeric types and no NaN
         df = df.fillna(0.0)
         return df
 
@@ -197,85 +253,242 @@ class FeatureStore:
         self,
         train_df: pd.DataFrame,
         warm_items: set[int],
+        all_items: set[int] | None = None,
         ratio: int = 4,
     ) -> pd.DataFrame:
         """Sample implicit negatives for each positive training pair.
 
-        For each positive (user, item) in ``train_df``, sample ``ratio``
-        unseen warm items the user has NOT rated at all in train.
+        Stratified sampling: half the budget from warm items (≥cold_item_threshold
+        ratings), the other half from cold/obscure items not in warm_items.
+        This prevents the model from learning "unrated cold item = positive"
+        when cold items appear only as positives in the actual rating data.
 
         Parameters
         ----------
-        train_df:
-            Training pairs (must have ``rating`` and ``userId``, ``movieId``).
         warm_items:
-            Set of item IDs eligible for negative sampling (warm catalog).
+            Items with enough ratings to be considered "warm" (used for first
+            half of negative budget).
+        all_items:
+            Full item catalog. When provided, samples from all catalog items
+            (warm and cold) instead of warm_items only, so the model sees
+            cold/obscure items as negatives. When None, falls back to
+            warm_items only (legacy behaviour).
         ratio:
-            Number of negatives per positive.
-
-        Returns
-        -------
-        DataFrame with columns matching train_df schema plus ``is_positive=0``.
+            Exact number of synthetic negatives to generate per positive.
+            Total synthetic rows = n_positives × ratio.
         """
         threshold = self._config.data.relevance_threshold
         seed = self._config.data.random_seed
         rng = np.random.default_rng(seed)
 
-        warm_items_arr = np.array(sorted(warm_items), dtype=np.int32)
+        # Pool = all catalog items when provided, else warm items only (legacy)
+        pool_set = all_items if all_items else warm_items
+        pool_arr = np.array(sorted(pool_set), dtype=np.int32)
+        n_pool = len(pool_arr)
 
-        # All positives from train
-        positives = train_df[train_df["rating"] >= threshold][
-            ["userId", "movieId", "timestamp"]
-        ].copy()
+        _EMPTY = pd.DataFrame(
+            columns=["userId", "movieId", "rating", "timestamp", "is_positive"]
+        )
 
+        if n_pool == 0:
+            return _EMPTY
+
+        positives = train_df[train_df["rating"] >= threshold]
         if len(positives) == 0:
-            empty = pd.DataFrame(
-                columns=["userId", "movieId", "rating", "timestamp", "is_positive"]
-            )
-            return empty
+            return _EMPTY
 
-        # Pre-build per-user rated sets for O(1) lookup
-        user_rated: dict[int, set[int]] = (
+        pos_counts = positives.groupby("userId").size()
+        user_ts = positives.groupby("userId")["timestamp"].median().astype("int64")
+
+        user_rated: dict[int, frozenset] = (
             train_df.groupby("userId")["movieId"]
-            .apply(set)
+            .apply(frozenset)
             .to_dict()
         )
 
-        neg_rows: list[dict] = []
+        uid_chunks: list[np.ndarray] = []
+        mid_chunks: list[np.ndarray] = []
+        ts_chunks: list[np.ndarray] = []
 
-        for _, pos_row in positives.iterrows():
-            uid = int(pos_row["userId"])
-            rated = user_rated.get(uid, set())
+        for uid, n_pos in pos_counts.items():
+            rated_fs = user_rated.get(int(uid), frozenset())
+            ts_val = int(user_ts.get(uid, 0))
 
-            candidates = warm_items_arr[
-                ~np.isin(warm_items_arr, list(rated))
-            ]
-            if len(candidates) == 0:
+            n_target = min(ratio * int(n_pos), n_pool)
+            if n_target <= 0:
+                continue
+            n_oversample = min(n_target + len(rated_fs) + 10, n_pool)
+            cands = rng.choice(pool_arr, size=n_oversample, replace=False)
+            keep = np.array([m not in rated_fs for m in cands], dtype=bool)
+            combined = cands[keep][:n_target].astype(np.int32)
+
+            n = len(combined)
+            if n == 0:
                 continue
 
-            n_sample = min(ratio, len(candidates))
-            sampled = rng.choice(candidates, size=n_sample, replace=False)
+            uid_chunks.append(np.full(n, uid, dtype=np.int32))
+            mid_chunks.append(combined)
+            ts_chunks.append(np.full(n, ts_val, dtype=np.int64))
 
-            for mid in sampled:
-                neg_rows.append(
-                    {
-                        "userId": uid,
-                        "movieId": int(mid),
-                        "rating": 0.0,
-                        "timestamp": int(pos_row["timestamp"]),
-                        "is_positive": 0,
-                    }
-                )
+        if not uid_chunks:
+            return _EMPTY
 
-        if not neg_rows:
-            return pd.DataFrame(
-                columns=["userId", "movieId", "rating", "timestamp", "is_positive"]
-            )
+        all_uids = np.concatenate(uid_chunks)
+        all_mids = np.concatenate(mid_chunks)
+        all_ts = np.concatenate(ts_chunks)
+        n_total = len(all_uids)
 
-        neg_df = pd.DataFrame(neg_rows)
-        neg_df["userId"] = neg_df["userId"].astype("int32")
-        neg_df["movieId"] = neg_df["movieId"].astype("int32")
-        neg_df["rating"] = neg_df["rating"].astype("float32")
-        neg_df["timestamp"] = neg_df["timestamp"].astype("int64")
-        neg_df["is_positive"] = neg_df["is_positive"].astype("int8")
-        return neg_df
+        return pd.DataFrame({
+            "userId": all_uids,
+            "movieId": all_mids,
+            "rating": np.zeros(n_total, dtype=np.float32),
+            "timestamp": all_ts,
+            "is_positive": np.zeros(n_total, dtype=np.int8),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _inject_mf_scores_batch(chunk: pd.DataFrame, als_gen) -> pd.DataFrame:
+    """Inject real ALS dot-product scores into the ``mf_score`` column."""
+    u_idx = chunk["userId"].map(als_gen._user_id_to_idx).fillna(-1).astype(int).values
+    m_idx = chunk["movieId"].map(als_gen._movie_id_to_idx).fillna(-1).astype(int).values
+    valid = (u_idx >= 0) & (m_idx >= 0)
+    mf_scores = np.zeros(len(chunk), dtype=np.float32)
+    if valid.any():
+        mf_scores[valid] = np.einsum(
+            "ij,ij->i",
+            als_gen._user_factors[u_idx[valid]],
+            als_gen._item_factors[m_idx[valid]],
+        )
+    chunk = chunk.copy()
+    chunk["mf_score"] = mf_scores
+    return chunk
+
+
+def _write_feature_parquet(
+    split_df: pd.DataFrame,
+    interaction_df: pd.DataFrame,
+    time_df: pd.DataFrame,
+    u_feat_names: list[str],
+    i_feat_names: list[str],
+    intr_feat_names: list[str],
+    time_feat_names: list[str],
+    feature_columns: list[str],
+    uid_to_idx: dict[int, int],
+    mid_to_idx: dict[int, int],
+    u_mat: np.ndarray,
+    i_mat: np.ndarray,
+    als_gen,
+    output_path: Path,
+    chunk_size: int = 500_000,
+) -> None:
+    """Assemble and write a feature parquet for one split (train/val/test).
+
+    Works the same way for all three splits.  For train (20 M rows) the
+    chunked write keeps peak RAM bounded to ~1 GB.  For val/test (~1–2 M
+    rows) it completes in a few chunks.
+
+    Column order in the output is always:
+        userId | movieId | is_positive | <feature_columns in order>
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    inject_mf = (
+        als_gen is not None
+        and getattr(als_gen, "_is_fitted", False)
+        and "mf_score" in feature_columns
+    )
+
+    # Merge interaction + time to form base (only the narrow interaction cols)
+    base = (
+        interaction_df[["userId", "movieId"] + intr_feat_names]
+        .merge(
+            time_df[["userId", "movieId"] + time_feat_names],
+            on=["userId", "movieId"],
+            how="left",
+        )
+    )
+
+    # Add is_positive from split_df
+    pos_lookup = (
+        split_df[["userId", "movieId", "is_positive"]]
+        .drop_duplicates(["userId", "movieId"])
+        .set_index(["userId", "movieId"])["is_positive"]
+    )
+    base_idx = pd.MultiIndex.from_arrays([base["userId"], base["movieId"]])
+    base["is_positive"] = pos_lookup.reindex(base_idx).fillna(0).astype("int8").values
+
+    base_uids = base["userId"].values
+    base_mids = base["movieId"].values
+    n_base = len(base)
+
+    u_idx = np.fromiter(
+        (uid_to_idx.get(int(u), -1) for u in base_uids), dtype=np.int32, count=n_base
+    )
+    m_idx = np.fromiter(
+        (mid_to_idx.get(int(m), -1) for m in base_mids), dtype=np.int32, count=n_base
+    )
+
+    pq_writer: pq.ParquetWriter | None = None
+    try:
+        for s in range(0, n_base, chunk_size):
+            e = min(s + chunk_size, n_base)
+            chu: dict = {}
+            chu["userId"] = base_uids[s:e]
+            chu["movieId"] = base_mids[s:e]
+            chu["is_positive"] = base["is_positive"].values[s:e]
+
+            u_sel = u_idx[s:e]
+            m_sel = m_idx[s:e]
+            valid_u = u_sel >= 0
+            valid_m = m_sel >= 0
+
+            for j, col in enumerate(u_feat_names):
+                vals = np.zeros(e - s, dtype=np.float32)
+                vals[valid_u] = u_mat[u_sel[valid_u], j]
+                chu[col] = vals
+
+            for j, col in enumerate(i_feat_names):
+                vals = np.zeros(e - s, dtype=np.float32)
+                vals[valid_m] = i_mat[m_sel[valid_m], j]
+                chu[col] = vals
+
+            for col in intr_feat_names + time_feat_names:
+                chu[col] = base[col].values[s:e]
+
+            chunk_df = pd.DataFrame(chu)
+
+            if inject_mf:
+                chunk_df = _inject_mf_scores_batch(chunk_df, als_gen)
+
+            # Ensure final column order matches feature_columns exactly
+            out_cols = list(dict.fromkeys(
+                ["userId", "movieId", "is_positive"]
+                + [c for c in feature_columns if c in chunk_df.columns]
+            ))
+            # Fill any feature columns absent from this chunk with 0.0
+            for missing in set(feature_columns) - set(chunk_df.columns):
+                chunk_df[missing] = np.float32(0.0)
+            chunk_df = chunk_df[out_cols]
+
+            table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+            if pq_writer is None:
+                pq_writer = pq.ParquetWriter(str(output_path), table.schema)
+            pq_writer.write_table(table)
+            logger.info("  %s: wrote rows %d–%d / %d", output_path.name, s, e, n_base)
+            del chunk_df, table
+    finally:
+        if pq_writer:
+            pq_writer.close()
+
+    logger.info(
+        "_write_feature_parquet: %s written (%d rows, %d feature cols%s).",
+        output_path.name,
+        n_base,
+        len(feature_columns),
+        " + mf_scores injected" if inject_mf else "",
+    )

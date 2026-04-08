@@ -825,3 +825,36 @@ class TestNegativeSampling:
         train = self._make_train()
         neg_df = store_default.get_negative_samples(train, warm_items=set(), ratio=4)
         assert len(neg_df) == 0
+
+    def test_stratified_includes_cold_items(self, store_default: FeatureStore) -> None:
+        """When all_items is provided, cold items must appear as negatives."""
+        train = self._make_train()
+        warm_items = {5, 6, 7, 8, 9, 10}
+        all_items = warm_items | {20, 21, 22, 23, 24}  # 5 cold items
+        neg_df = store_default.get_negative_samples(train, warm_items, all_items=all_items, ratio=4)
+        sampled = set(neg_df["movieId"].tolist())
+        cold_items = all_items - warm_items
+        assert sampled & cold_items, "No cold items found in stratified negatives"
+        assert sampled & warm_items, "No warm items found in stratified negatives"
+
+    def test_stratified_no_rated_items(self, store_default: FeatureStore) -> None:
+        """Stratified negatives must not include items the user has already rated."""
+        train = self._make_train()
+        warm_items = {5, 6, 7, 8, 9, 10}
+        all_items = warm_items | {20, 21, 22, 23, 24}
+        neg_df = store_default.get_negative_samples(train, warm_items, all_items=all_items, ratio=4)
+        for uid, group in neg_df.groupby("userId"):
+            rated = set(train[train["userId"] == uid]["movieId"].tolist())
+            overlap = rated & set(group["movieId"].tolist())
+            assert len(overlap) == 0, f"user {uid}: stratified negatives overlap rated {overlap}"
+
+    def test_empty_warm_with_all_items_uses_cold_only(self, store_default: FeatureStore) -> None:
+        """When warm_items is empty but all_items has cold items, cold negatives are generated."""
+        train = self._make_train()
+        cold_only = {20, 21, 22, 23, 24, 25}
+        neg_df = store_default.get_negative_samples(
+            train, warm_items=set(), all_items=cold_only, ratio=4
+        )
+        # Cold items don't overlap with user-rated items (1,2,3), so negatives exist
+        assert len(neg_df) > 0
+        assert set(neg_df["movieId"].tolist()).issubset(cold_only)

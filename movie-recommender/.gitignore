@@ -16,6 +16,9 @@ __pycache__/
 .venv/
 movie/
 
+#mlruns
+mlruns/
+
 # Java / JVM
 *.class
 *.jar
@@ -62,3 +65,7 @@ reports/
 # Ignore archive and data
 archive.zip
 data/
+
+artifacts/
+
+.claude

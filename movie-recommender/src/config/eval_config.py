@@ -17,6 +17,13 @@ class EvalConfig(BaseConfig):
     # ── warm-user eval filter ─────────────────────────────────────────────────
     warm_user_min_positives: int = 3
 
+    # ── eval-time candidate pool sizes ───────────────────────────────────────
+    # Larger than training pools to maximise retrieval recall during evaluation.
+    n_candidates_pop_eval: int = 500
+    n_candidates_cf_eval: int = 300
+    n_candidates_mf_eval: int = 500
+    n_history_candidates: int = 50   # user's own train positives added as candidates
+
     # ── ranking metrics ───────────────────────────────────────────────────────
     metrics: list[str] = field(
         default_factory=lambda: ["map", "ndcg", "precision", "recall", "mrr"]

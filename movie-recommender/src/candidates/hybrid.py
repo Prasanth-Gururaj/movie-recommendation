@@ -70,19 +70,22 @@ class HybridCandidateGenerator(BaseCandidateGenerator):
         cf_candidates = self._cf.generate(user_id, user_features, n_cf, rated)
         als_candidates = self._als.generate(user_id, user_features, n_mf, rated)
 
-        extra_needed = 0
-        if not cf_candidates:
+        # Fix 4 — proportional fallback: fill any shortfall (not just total absence)
+        # from the popularity generator so the pool always reaches n_pop + n_cf + n_mf.
+        cf_shortfall = n_cf - len(cf_candidates)
+        als_shortfall = n_mf - len(als_candidates)
+        extra_needed = cf_shortfall + als_shortfall
+
+        if cf_shortfall > 0:
             logger.debug(
-                "HybridCandidateGenerator: CF empty for user %d — using extra popularity.",
-                user_id,
+                "HybridCandidateGenerator: CF returned %d/%d for user %d — filling gap with popularity.",
+                len(cf_candidates), n_cf, user_id,
             )
-            extra_needed += n_cf
-        if not als_candidates:
+        if als_shortfall > 0:
             logger.debug(
-                "HybridCandidateGenerator: ALS empty for user %d — using extra popularity.",
-                user_id,
+                "HybridCandidateGenerator: ALS returned %d/%d for user %d — filling gap with popularity.",
+                len(als_candidates), n_mf, user_id,
             )
-            extra_needed += n_mf
 
         if extra_needed > 0:
             total_pop = n_pop + extra_needed

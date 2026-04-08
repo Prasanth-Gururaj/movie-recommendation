@@ -39,7 +39,18 @@ class TimeFeatureBuilder(BaseFeatureBuilder):
         self,
         data: dict[str, pd.DataFrame],
         train_df: pd.DataFrame,
+        *,
+        pairs_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        """Build time features for each (userId, movieId) pair.
+
+        Parameters
+        ----------
+        pairs_df:
+            If provided, compute features for these (userId, movieId,
+            timestamp) pairs instead of extracting pairs from ``train_df``.
+            ``train_df`` is still used to record ``_train_max_ts``.
+        """
         user_feat: pd.DataFrame = data["user_features"]
         item_feat: pd.DataFrame = data["item_features"]
 
@@ -47,8 +58,9 @@ class TimeFeatureBuilder(BaseFeatureBuilder):
         self._train_max_ts = train_max_ts
 
         # One row per unique (userId, movieId) pair — keep timestamp
+        _source = pairs_df if pairs_df is not None else train_df
         pairs = (
-            train_df[["userId", "movieId", "timestamp"]]
+            _source[["userId", "movieId", "timestamp"]]
             .drop_duplicates(subset=["userId", "movieId"])
             .reset_index(drop=True)
             .copy()
